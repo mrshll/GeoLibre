@@ -11,6 +11,7 @@ import { defineConfig, loadEnv, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { bundledPlugins } from "./vite-plugins/bundled-plugins";
 import { copyCesiumAssets } from "./vite-plugins/copy-cesium-assets";
+import { copyDynamicalGribLicenses } from "./vite-plugins/copy-dynamical-grib-licenses";
 import { copyVectorOps } from "./vite-plugins/copy-vector-ops";
 import { sharedH5wasmChunkPlugin, workerH5wasmFromMainPlugin } from "./vite-plugins/shared-h5wasm";
 import {
@@ -1490,6 +1491,9 @@ export default defineConfig({
     stripDuckDbWorkerSourcemapPlugin(),
     projectUrlQueryPlugin(),
     bundledPlugins(path.resolve(__dirname, "public/plugins")),
+    copyDynamicalGribLicenses(
+      path.resolve(__dirname, "../../packages/plugins/src/plugins/dynamical-grib"),
+    ),
     copyVectorOps(
       path.resolve(__dirname, "../../backend/geolibre_server/geolibre_server/vector_ops.py"),
       path.resolve(__dirname, "src/lib/pyodide/vector_ops.generated.py"),

@@ -373,6 +373,12 @@ async function sliceIsMissing(
   }
 }
 
+/** Whether two selections name the same steps. */
+function sameIndices(a: Record<string, number>, b: Record<string, number>): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
+}
+
 /** The renderer selector for the chosen steps. */
 function selectorFor(axes: SliceAxis[], indices: Record<string, number>): Record<string, number> {
   const selector: Record<string, number> = {};
@@ -465,8 +471,11 @@ function buildPanel(container: HTMLElement): () => void {
   /** Whether `axes` belongs to the chosen variable; Add waits for it. */
   let axesReady = false;
   let sliceTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Whether the status line holds a re-slice failure, which the next success clears. */
-  let sliceErrorShown = false;
+  /**
+   * Whether the status line speaks of one slice (a re-slice failure, or a slice with no data),
+   * which the next successful re-slice clears.
+   */
+  let sliceNoteShown = false;
 
   const statusBox = element("div");
   const setStatus = (message: string | null, error = false): void => {
@@ -825,7 +834,7 @@ function buildPanel(container: HTMLElement): () => void {
     sliceTimer = setTimeout(() => {
       sliceTimer = null;
       sliceChain = sliceChain.then(applyLiveSlice).catch((error: unknown) => {
-        sliceErrorShown = true;
+        sliceNoteShown = true;
         setStatus(
           tr("resliceFailed", "Could not show that slice: {{message}}", {
             message: errorMessage(error),
@@ -847,8 +856,8 @@ function buildPanel(container: HTMLElement): () => void {
     const applied = await setZarrLayerSelector(live.id, selectorFor(sliceAxes, indices));
     if (!applied || disposed) return;
     // The slice now shown is fine, whatever an earlier one reported.
-    if (sliceErrorShown) {
-      sliceErrorShown = false;
+    if (sliceNoteShown) {
+      sliceNoteShown = false;
       setStatus(null);
     }
     const store = useAppStore.getState();
@@ -942,7 +951,16 @@ function buildPanel(container: HTMLElement): () => void {
         });
       }
       state.live = { id: layerId, datasetId: dataset.id, variable: variable.name, name };
-      if (dataset.virtual && (await sliceIsMissing(dataset, variable, store, indices))) {
+      const missing = dataset.virtual && (await sliceIsMissing(dataset, variable, store, indices));
+      // Only while the layer still shows the slice that was checked: a slider moved meanwhile has
+      // re-sliced it, or is about to.
+      if (
+        missing &&
+        !disposed &&
+        state.live?.id === layerId &&
+        sameIndices(state.indices, indices)
+      ) {
+        sliceNoteShown = true;
         setStatus(
           tr(
             "addedEmpty",

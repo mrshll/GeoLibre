@@ -16,8 +16,10 @@ The decoder runs on one thread without SharedArrayBuffer or COOP/COEP headers.
 - `retry-fetch.ts` supplies an Icechunk fetch client for virtual byte ranges,
   retrying network errors, HTTP 429 and HTTP 5xx with abort-aware backoff.
 - `LICENSE-gribberish` and `THIRD_PARTY_LICENSES` contain redistribution
-  notices for the wasm's runtime dependencies. Keep these notices with any
-  distributed decoder bundle.
+  notices for the wasm's runtime dependencies. Vite builds emit them at
+  `licenses/dynamical-grib.txt` in the build output (`dist/` for web, Tauri,
+  and lite; `dist-embed/` for embed, copied into the Python wheel's
+  `geolibre/static/app/`). Keep these notices with any distributed decoder bundle.
 
 To rebuild (Rust **1.97.0**, `wasm32-unknown-unknown`, and
 **wasm-bindgen-cli 0.2.129** are required):
