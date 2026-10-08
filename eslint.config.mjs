@@ -41,6 +41,7 @@ export default [
       "**/public/plugins/**",
       "**/*.min.js",
       "**/*.d.ts",
+      "packages/plugins/src/plugins/dynamical-grib/gribwasm.js",
     ],
   },
   {

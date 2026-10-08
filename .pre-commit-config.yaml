@@ -82,6 +82,8 @@ repos:
       - id: oxfmt
         name: oxfmt (JS/TS/JSON/CSS/YAML/TOML)
         entry: oxfmt --write
+        # Preserve wasm-bindgen output covered by the decoder's SHA256SUMS.
+        exclude: ^packages/plugins/src/(dynamical-grib-wasm-url\.d\.ts|plugins/dynamical-grib/gribwasm(\.js|\.d\.ts|_bg\.wasm\.d\.ts))$
         language: node
         # Single source of truth for the oxfmt version (pre-commit.ci runs
         # this hook directly, no separate CI pin to keep in sync).

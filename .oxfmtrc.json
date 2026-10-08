@@ -25,6 +25,7 @@
     "**/*.d.ts",
     "**/*.generated.js",
     "**/*.generated.py",
+    "packages/plugins/src/plugins/dynamical-grib/gribwasm.js",
     "**/cesium/**",
     "**/jupyterlite/**",
     "apps/geolibre-desktop/public/**",

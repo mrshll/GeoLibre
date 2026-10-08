@@ -32,6 +32,7 @@ many transitive dependencies they rely on).
 - [STAC](https://stacspec.org/) — the SpatioTemporal Asset Catalog specification and tooling.
 - [Zarr](https://zarr.dev/) and [CarbonPlan](https://carbonplan.org/) — cloud-native multidimensional array access.
 - [Icechunk](https://icechunk.io/) and [icechunk-js](https://github.com/EarthyScience/icechunk-js) — transactional storage for Zarr, read in the browser.
+- [gribberish](https://github.com/mpiannucci/gribberish) — GRIB2 decoding, compiled to WebAssembly for dynamical.org's virtual datasets.
 - [H3](https://h3geo.org/) — hexagonal hierarchical spatial indexing.
 
 ### Python sidecar and notebooks
