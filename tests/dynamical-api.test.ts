@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  chunkKey,
+  coordinatePaths,
   DYNAMICAL_CATALOG_URL,
   datasetMapSupport,
   defaultSliceIndex,
@@ -8,6 +10,8 @@ import {
   fetchDynamicalCatalog,
   formatLeadTime,
   formatUtc,
+  MAX_STEP_PROBES,
+  newestAvailableStep,
   parseDynamicalCatalog,
   parseDynamicalCollection,
   projectedBounds,
@@ -262,13 +266,40 @@ describe("datasetMapSupport", () => {
     assert.equal(datasetMapSupport(mixed), "time-series");
   });
 
-  it("refuses a time-series layout and a virtual repository", () => {
+  it("refuses a time-series layout", () => {
     assert.equal(datasetMapSupport(parsed(gfsAnalysis)), "time-series");
-    assert.equal(datasetMapSupport(parsed(gfsVirtual)), "virtual");
+  });
+
+  it("draws a virtual repository, whose every chunk is one GRIB message", () => {
+    assert.equal(datasetMapSupport(parsed(gfsVirtual)), "supported");
+  });
+
+  it("judges a virtual repository on its chunk layout like any other", () => {
+    const deep = parsed({
+      ...gfsVirtual,
+      "cube:variables": {
+        temperature_2m: {
+          ...gfsVirtual["cube:variables"].temperature_2m,
+          chunks: [1, 209, 721, 1440],
+        },
+      },
+    });
+    assert.equal(deep.virtual, true);
+    assert.equal(datasetMapSupport(deep), "time-series");
   });
 });
 
 describe("slice dimensions", () => {
+  it("looks for a grouped variable's coordinates beside it first", () => {
+    // The virtual repositories keep level variables in groups, each with its own coordinates.
+    assert.deepEqual(coordinatePaths("pressure_level/temperature", "pressure_level"), [
+      "pressure_level/pressure_level",
+      "pressure_level",
+    ]);
+    assert.deepEqual(coordinatePaths("a/b/c", "init_time"), ["a/b/init_time", "init_time"]);
+    assert.deepEqual(coordinatePaths("temperature_2m", "lead_time"), ["lead_time"]);
+  });
+
   it("lists the non-spatial dimensions in array order", () => {
     const dataset = parsed(gfsForecast);
     assert.deepEqual(sliceDimensions(dataset, dataset.variables[0]), ["init_time", "lead_time"]);
@@ -288,6 +319,72 @@ describe("slice dimensions", () => {
     assert.equal(sliceSelectorValue(2, [0, 1, 2, 3]), 2);
     // Numbered from one: index 2 would select member 2 at index 1, so pass the value.
     assert.equal(sliceSelectorValue(2, [1, 2, 3, 4]), 3);
+  });
+});
+
+// A virtual repository lists a run as soon as its first GRIB file lands, so the newest run is often
+// still arriving and its later lead times have no chunks yet.
+describe("virtual step availability", () => {
+  it("names a chunk the way zarr's chunk key encodings do", () => {
+    const encoding = { name: "default", configuration: { separator: "/" } };
+    assert.equal(
+      chunkKey("temperature_2m", [7945, 208, 0, 0], encoding),
+      "/temperature_2m/c/7945/208/0/0",
+    );
+    assert.equal(
+      chunkKey("/a/b", [1, 2], { name: "default", configuration: { separator: "." } }),
+      "/a/b/c.1.2",
+    );
+    assert.equal(chunkKey("t", [3, 0], { name: "default" }), "/t/c/3/0");
+    assert.equal(chunkKey("t", [3, 0], { name: "v2" }), "/t/3.0");
+    assert.equal(chunkKey("t", [], { name: "v2" }), "/t/0");
+    assert.equal(chunkKey("t", [3], { name: "other" }), null);
+  });
+
+  it("opens on the newest step that has arrived", async () => {
+    const probed: number[] = [];
+    const arrived = new Set([7940, 7941, 7942]);
+    const found = await newestAvailableStep(7946, async (run) => {
+      probed.push(run);
+      return arrived.has(run);
+    });
+    assert.deepEqual(found, { index: 7942, status: "found" });
+    assert.deepEqual(probed, [7945, 7944, 7943, 7942]);
+  });
+
+  it("keeps the newest step, unverified, when no probe within the limit finds one", async () => {
+    let probes = 0;
+    const none = await newestAvailableStep(7946, async () => {
+      probes += 1;
+      return false;
+    });
+    assert.deepEqual(none, { index: 7945, status: "none" });
+    assert.equal(probes, MAX_STEP_PROBES);
+    assert.deepEqual(await newestAvailableStep(3, async () => false), { index: 2, status: "none" });
+    assert.deepEqual(await newestAvailableStep(0, async () => true), { index: 0, status: "none" });
+  });
+
+  it("stops at a failed probe and says so, rather than reading an outage as a missing step", async () => {
+    const outage = new Error("Failed to fetch");
+    let probes = 0;
+    const failed = await newestAvailableStep(10, async () => {
+      probes += 1;
+      throw outage;
+    });
+    assert.deepEqual(failed, { index: 9, status: "failed", error: outage });
+    assert.equal(probes, 1);
+  });
+
+  it("reports a failure after the newest step was found missing as unverified", async () => {
+    const outage = new Error("HTTP 503");
+    const probed: number[] = [];
+    const failed = await newestAvailableStep(10, async (run) => {
+      probed.push(run);
+      if (run === 9) return false;
+      throw outage;
+    });
+    assert.deepEqual(failed, { index: 9, status: "failed", error: outage });
+    assert.deepEqual(probed, [9, 8]);
   });
 });
 

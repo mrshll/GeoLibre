@@ -7,6 +7,9 @@ import {
   DYNAMICAL_HOME_URL,
   type DynamicalDataset,
   type DynamicalVariable,
+  type StepAvailability,
+  chunkKey,
+  coordinatePaths,
   datasetMapSupport,
   defaultSliceIndex,
   defaultVariableStyle,
@@ -14,7 +17,9 @@ import {
   formatLeadTime,
   formatUtc,
   isLeadTimeDimension,
+  isSpatialDimension,
   isTemporalDimension,
+  newestAvailableStep,
   projectedBounds,
   projectedDimensions,
   projectionFromSpatialRef,
@@ -80,7 +85,11 @@ interface SliceAxis {
   name: string;
   /** What each step reads as. */
   labels: string[];
-  /** Raw numeric coordinates, for {@link sliceSelectorValue}; empty when the store has none. */
+  /**
+   * Raw numeric coordinates the renderer matches a selector against, for
+   * {@link sliceSelectorValue}. Empty when it cannot read them: the store has none, or they sit
+   * beside a grouped variable, where the renderer looks only at the root and so reads an index.
+   */
   coordinates: number[];
   /** Epoch milliseconds for a timestamp axis, seconds for a lead-time axis. */
   values: number[];
@@ -205,6 +214,24 @@ function durationUnitMs(units: unknown): number | null {
 }
 
 /**
+ * Where a variable's coordinate array along `dimension` is ({@link coordinatePaths}), or null when
+ * the repository has none. A group of the same name (`pressure_level/`) is not one.
+ */
+async function coordinatePath(
+  store: ZarrKeyReader,
+  variable: DynamicalVariable,
+  dimension: string,
+): Promise<string | null> {
+  for (const path of coordinatePaths(variable.name, dimension)) {
+    const bytes = await store.get(`/${path}/zarr.json`);
+    if (!bytes) continue;
+    const metadata = JSON.parse(new TextDecoder().decode(bytes)) as { node_type?: unknown };
+    if (metadata.node_type === "array") return path;
+  }
+  return null;
+}
+
+/**
  * Read the coordinates of each non-spatial dimension, to label the sliders. A dimension with no
  * coordinate array slides over its indices.
  */
@@ -224,26 +251,33 @@ function readSliceAxes(
         let attributes: Record<string, unknown> = {};
         // Only a coordinate the repository lacks falls back to indices. A failed read rejects,
         // which drops the cached promise, rather than labelling the sliders with indices all session.
-        if (await store.get(`/${name}/zarr.json`)) {
-          const array = await zarr.open.v3(root.resolve(name), { kind: "array" });
+        const path = await coordinatePath(store, variable, name);
+        if (path) {
+          const array = await zarr.open.v3(root.resolve(path), { kind: "array" });
           attributes = array.attrs as Record<string, unknown>;
           coordinates = toNumbers((await zarr.get(array)).data as ArrayLike<unknown>);
         } else {
           const size = dataset.dimensions[name]?.size ?? 1;
           coordinates = Array.from({ length: size }, (_, index) => index);
         }
+        const matched = path === name ? coordinates : [];
         const time = isTemporalDimension(dataset, name)
           ? parseCfTimeUnits(String(attributes.units ?? dataset.dimensions[name]?.unit ?? ""))
           : null;
         if (time) {
           const values = coordinates.map((value) => time.epochMs + value * time.unitMs);
-          axes.push({ name, coordinates, values, labels: values.map(formatUtc) });
+          axes.push({ name, coordinates: matched, values, labels: values.map(formatUtc) });
         } else if (isLeadTimeDimension(name)) {
           const unitMs = durationUnitMs(attributes.units ?? dataset.dimensions[name]?.unit) ?? 1000;
           const values = coordinates.map((value) => (value * unitMs) / 1000);
-          axes.push({ name, coordinates, values, labels: values.map(formatLeadTime) });
+          axes.push({ name, coordinates: matched, values, labels: values.map(formatLeadTime) });
         } else {
-          axes.push({ name, coordinates, values: coordinates, labels: coordinates.map(String) });
+          axes.push({
+            name,
+            coordinates: matched,
+            values: coordinates,
+            labels: coordinates.map(String),
+          });
         }
       }
       return axes;
@@ -252,6 +286,91 @@ function readSliceAxes(
     void pending.catch(() => axesCache.delete(key));
   }
   return pending;
+}
+
+/**
+ * A check of whether a virtual repository holds a chunk at a slice: the non-spatial dimensions at
+ * `indices`, the grid at its first chunk. It reads one byte, so it costs a manifest lookup and a
+ * tiny range read rather than a GRIB message. No reference reads as nothing; a failed upstream
+ * read throws.
+ *
+ * Returns:
+ *   The check, or null when the reader cannot read ranges or the array's chunk key is not one zarr
+ *   defines.
+ */
+async function sliceChunkCheck(
+  dataset: DynamicalDataset,
+  variable: DynamicalVariable,
+  store: ZarrKeyReader,
+): Promise<((indices: Record<string, number>) => Promise<boolean>) | null> {
+  const getRange = store.getRange?.bind(store);
+  if (!getRange) return null;
+  const bytes = await store.get(`/${variable.name}/zarr.json`);
+  if (!bytes) return null;
+  const metadata = JSON.parse(new TextDecoder().decode(bytes)) as {
+    chunk_grid?: { configuration?: { chunk_shape?: number[] } };
+    chunk_key_encoding?: { name?: unknown; configuration?: { separator?: unknown } };
+  };
+  const chunkShape = metadata.chunk_grid?.configuration?.chunk_shape ?? [];
+  const encoding = metadata.chunk_key_encoding;
+  if (chunkShape.length !== variable.dimensions.length || !encoding) return null;
+  return async (indices: Record<string, number>) => {
+    const coords = variable.dimensions.map((name, position) => {
+      const step = isSpatialDimension(dataset, name) ? 0 : (indices[name] ?? 0);
+      return Math.floor(step / Math.max(1, chunkShape[position]));
+    });
+    const key = chunkKey(variable.name, coords, encoding);
+    if (!key) return false;
+    const head = await getRange(key as `/${string}`, { offset: 0, length: 1 });
+    return Boolean(head?.length);
+  };
+}
+
+/**
+ * Where a virtual repository's run (or analysis time) slider should start: the newest step that
+ * has arrived, judged at the final lead time for a forecast run. Null when the variable has no
+ * such axis or its chunks cannot be checked.
+ */
+async function newestArrivedStep(
+  dataset: DynamicalDataset,
+  variable: DynamicalVariable,
+  store: ZarrKeyReader,
+  axes: SliceAxis[],
+  indices: Record<string, number>,
+): Promise<{ axis: string; found: StepAvailability } | null> {
+  const run =
+    axes.find((axis) => axis.name === "init_time") ?? axes.find((axis) => axis.name === "time");
+  if (!run) return null;
+  const check = await sliceChunkCheck(dataset, variable, store);
+  if (!check) return null;
+  const lead = axes.find((axis) => isLeadTimeDimension(axis.name));
+  const found = await newestAvailableStep(run.labels.length, (index) =>
+    check({
+      ...indices,
+      [run.name]: index,
+      ...(lead && run.name === "init_time" ? { [lead.name]: lead.labels.length - 1 } : {}),
+    }),
+  );
+  return { axis: run.name, found };
+}
+
+/**
+ * Whether a virtual repository has no chunk at a slice: one that has not arrived, or that the model
+ * never writes (an accumulation at +0 h). Such a slice draws blank. False when that cannot be
+ * checked, so only a confirmed absence is reported.
+ */
+async function sliceIsMissing(
+  dataset: DynamicalDataset,
+  variable: DynamicalVariable,
+  store: ZarrKeyReader,
+  indices: Record<string, number>,
+): Promise<boolean> {
+  try {
+    const check = await sliceChunkCheck(dataset, variable, store);
+    return check ? !(await check(indices)) : false;
+  } catch {
+    return false;
+  }
 }
 
 /** The renderer selector for the chosen steps. */
@@ -387,7 +506,7 @@ function buildPanel(container: HTMLElement): () => void {
       CSS.infoText,
       tr(
         "aboutAccess",
-        "GeoLibre reads the archives straight from their cloud storage, one map slice at a time. Datasets that store long time series in each chunk, and the low-latency virtual datasets (which reference the original GRIB files), cannot be drawn in the browser yet and are listed as unavailable.",
+        "GeoLibre reads the archives straight from their cloud storage, one map slice at a time. The low-latency virtual datasets reference the producers' original GRIB files, which GeoLibre decodes in the browser. Datasets that store long time series in each chunk cannot be drawn in the browser yet and are listed as unavailable.",
       ),
     ),
     aboutLinks,
@@ -451,8 +570,6 @@ function buildPanel(container: HTMLElement): () => void {
 
   const unsupportedReason = (dataset: DynamicalDataset): string | null => {
     switch (datasetMapSupport(dataset)) {
-      case "virtual":
-        return tr("unsupportedVirtual", "reads GRIB files, not drawable yet");
       case "time-series":
         return tr("unsupportedTimeSeries", "time-series layout, too large to map");
       default:
@@ -631,10 +748,40 @@ function buildPanel(container: HTMLElement): () => void {
             ? remembered
             : defaultSliceIndex(dataset, axis.name, axis.labels.length);
       }
+      // A virtual repository's newest run is often still arriving: open on the newest one that has
+      // arrived, unless a run (or time) is already set — chosen, or carried over from another
+      // variable of the dataset.
+      let unverified = false;
+      if (
+        dataset.virtual &&
+        state.indices.init_time === undefined &&
+        state.indices.time === undefined
+      ) {
+        const arrived = await newestArrivedStep(dataset, variable, store, axes, indices);
+        if (disposed || request !== axesRequest) return;
+        if (arrived) {
+          indices[arrived.axis] = arrived.found.index;
+          unverified = arrived.found.status !== "found";
+          if (arrived.found.status === "failed") {
+            console.warn(
+              "Could not check which dynamical.org runs have arrived",
+              arrived.found.error,
+            );
+          }
+        }
+      }
       state.indices = indices;
       axesReady = true;
       renderSliders();
       addButton.disabled = busy;
+      if (unverified) {
+        setStatus(
+          tr(
+            "arrivalUnverified",
+            "Could not confirm that the newest run has arrived; showing it anyway. Parts of it may be blank.",
+          ),
+        );
+      }
     } catch (error) {
       if (disposed || request !== axesRequest) return;
       slidersBox.replaceChildren();
@@ -795,6 +942,16 @@ function buildPanel(container: HTMLElement): () => void {
         });
       }
       state.live = { id: layerId, datasetId: dataset.id, variable: variable.name, name };
+      if (dataset.virtual && (await sliceIsMissing(dataset, variable, store, indices))) {
+        setStatus(
+          tr(
+            "addedEmpty",
+            "Added {{name}}, but the archive holds no data for this slice yet, so it draws blank. Try another lead time or an earlier run.",
+            { name: variable.longName },
+          ),
+        );
+        return;
+      }
       setStatus(
         sliceAxes.length
           ? tr(

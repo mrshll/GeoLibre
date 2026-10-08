@@ -51,7 +51,7 @@ export interface DynamicalVariable {
 }
 
 /** Why a dataset can or cannot be drawn in the browser. */
-export type DynamicalMapSupport = "supported" | "virtual" | "time-series";
+export type DynamicalMapSupport = "supported" | "time-series";
 
 /** A dataset (one STAC collection) reduced to what the panel shows and reads. */
 export interface DynamicalDataset {
@@ -66,7 +66,10 @@ export interface DynamicalDataset {
   docsUrl: string;
   /** The repository's HTTPS address, which the Icechunk reader opens. */
   repositoryUrl: string;
-  /** Whether chunks point into the producer's GRIB files rather than at Zarr chunks. */
+  /**
+   * Whether chunks point into the producer's GRIB files rather than at Zarr chunks. They decode
+   * through the `gribberish` codec (`dynamical-grib/`), one GRIB message per chunk.
+   */
   virtual: boolean;
   bbox: [number, number, number, number] | null;
   dimensions: Record<string, DynamicalDimension>;
@@ -279,14 +282,12 @@ export function slicesPerChunk(dataset: DynamicalDataset, variable: DynamicalVar
 }
 
 /**
- * Whether the browser can draw a dataset.
+ * Whether the browser can draw a dataset, judged on its chunk layout ({@link MAX_SLICES_PER_CHUNK}).
  *
- * Virtual repositories reference the producer's GRIB2 files and decode them with the `gribberish`
- * codec, which has no JavaScript build; the others are judged on their chunk layout
- * ({@link MAX_SLICES_PER_CHUNK}).
+ * Virtual repositories are judged the same way. Their chunks are the producer's GRIB2 messages,
+ * one slice each, which the `gribberish` codec decodes in the browser.
  */
 export function datasetMapSupport(dataset: DynamicalDataset): DynamicalMapSupport {
-  if (dataset.virtual) return "virtual";
   // The worst variable decides: the panel offers every variable of a dataset it lists as ready.
   const worst = Math.max(
     1,
@@ -298,6 +299,16 @@ export function datasetMapSupport(dataset: DynamicalDataset): DynamicalMapSuppor
 /** A variable's non-spatial dimensions, in array order: the ones the panel picks a slice of. */
 export function sliceDimensions(dataset: DynamicalDataset, variable: DynamicalVariable): string[] {
   return variable.dimensions.filter((name) => !isSpatialDimension(dataset, name));
+}
+
+/**
+ * Where to look for a variable's coordinate along `dimension`, in order: beside the variable in its
+ * group, then at the root. The virtual repositories keep level variables in groups
+ * (`pressure_level/temperature`), each holding its own coordinates.
+ */
+export function coordinatePaths(variable: string, dimension: string): string[] {
+  const slash = variable.lastIndexOf("/");
+  return slash > 0 ? [`${variable.slice(0, slash)}/${dimension}`, dimension] : [dimension];
 }
 
 /**
@@ -386,6 +397,73 @@ export function isTemporalDimension(dataset: DynamicalDataset, name: string): bo
 export function defaultSliceIndex(dataset: DynamicalDataset, name: string, length: number): number {
   if (length <= 0) return 0;
   return isTemporalDimension(dataset, name) ? length - 1 : 0;
+}
+
+/** Most steps {@link newestAvailableStep} checks, newest first, before settling for the newest. */
+export const MAX_STEP_PROBES = 8;
+
+/**
+ * What {@link newestAvailableStep} found: `found` when a step passed, `none` when no step within
+ * the limit did, `failed` when a check failed (with its error). Only `found` is verified; the
+ * other two fall back to the newest step.
+ */
+export type StepAvailability =
+  | { index: number; status: "found" | "none" }
+  | { index: number; status: "failed"; error: unknown };
+
+/**
+ * Where a virtual repository's run or time slider starts: the newest step that has arrived.
+ *
+ * A virtual repository lists a run as soon as its first GRIB file lands, so its newest run is often
+ * still arriving, and opening on it would leave most of the lead-time slider blank. "Arrived" is
+ * the caller's check: for a forecast, a chunk at the run's final lead time (which says nothing of
+ * the leads between, nor of their values); for an analysis, a chunk at that time.
+ *
+ * Args:
+ *   length: How many steps the axis holds.
+ *   hasArrived: Whether step `index` has arrived.
+ *   maxProbes: Most steps to check.
+ *
+ * Returns:
+ *   The newest step that passes, or the newest step when none within `maxProbes` does or a check
+ *   fails. A failure stops the walk: an upstream outage is not evidence that a run is missing.
+ */
+export async function newestAvailableStep(
+  length: number,
+  hasArrived: (index: number) => Promise<boolean>,
+  maxProbes: number = MAX_STEP_PROBES,
+): Promise<StepAvailability> {
+  const newest = Math.max(0, length - 1);
+  for (let index = newest; index >= 0 && index > newest - maxProbes && length > 0; index -= 1) {
+    try {
+      if (await hasArrived(index)) return { index, status: "found" };
+    } catch (error) {
+      return { index: newest, status: "failed", error };
+    }
+  }
+  return { index: newest, status: "none" };
+}
+
+/**
+ * The store key of one chunk, under a zarr v3 `chunk_key_encoding`.
+ *
+ * Returns:
+ *   A rooted key, or null for an encoding zarr does not define.
+ */
+export function chunkKey(
+  path: string,
+  coords: readonly number[],
+  encoding: { name?: unknown; configuration?: { separator?: unknown } },
+): string | null {
+  const base = `/${path.replace(/^\/+|\/+$/g, "")}`;
+  const separator = encoding.configuration?.separator;
+  if (encoding.name === "default") {
+    return `${base}/${["c", ...coords].join(typeof separator === "string" ? separator : "/")}`;
+  }
+  if (encoding.name === "v2") {
+    return `${base}/${coords.join(typeof separator === "string" ? separator : ".") || "0"}`;
+  }
+  return null;
 }
 
 /**

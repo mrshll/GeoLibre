@@ -20,6 +20,15 @@ import { readCoordinateTimeAttributes, type ZarrTimeAttributes } from "./zarr-ti
  */
 export interface ZarrKeyReader {
   get(key: `/${string}`, options?: { signal?: AbortSignal }): Promise<Uint8Array | undefined>;
+  /**
+   * Part of a key's bytes. An Icechunk reader has it, so a check that a virtual chunk exists reads
+   * one byte of its GRIB message rather than all of it.
+   */
+  getRange?(
+    key: `/${string}`,
+    range: { offset: number; length: number },
+    options?: { signal?: AbortSignal },
+  ): Promise<Uint8Array | undefined>;
 }
 
 /** The branch a catalog reads when it names none. */
@@ -63,9 +72,19 @@ export function openIcechunkStore(
   return shareRepositoryOpen(
     repositoryKey(url, branch),
     async () => {
-      const { IcechunkStore } = await import("icechunk-js");
+      const [{ IcechunkStore }, { registerGribberishCodec }, { retryingFetchClient }] =
+        await Promise.all([
+          import("icechunk-js"),
+          import("./dynamical-grib/codec"),
+          import("./dynamical-grib/retry-fetch"),
+        ]);
+      // A virtual repository's chunks are byte ranges of the producer's GRIB2 files, decoded by
+      // the `gribberish` codec; its wasm loads on the first such read, not here. The fetch client
+      // serves only those upstream reads, so it can retry the 503s (without CORS headers, so
+      // seen as network errors) that ECMWF's bucket answers under load.
+      await registerGribberishCodec();
       // Uncast, so a change to the library's reader contract fails the build, not the layer.
-      return IcechunkStore.open(url, { branch });
+      return IcechunkStore.open(url, { branch, fetchClient: retryingFetchClient() });
     },
     signal,
   );
